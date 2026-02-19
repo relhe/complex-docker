@@ -1,52 +1,55 @@
 version: "3"
+
 services:
-  postgres:
-    image: "postgres:latest"
-    environment:
-      - POSTGRES_PASSWORD=postgres_password
-  redis:
-    image: "redis:latest"
-  api:
-    build:
-      dockerfile: Dockerfile.dev
-      context: ./server
-    volumes:
-      - /app/node_modules
-      - ./server:/app
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - PGUSER=postgres
-      - PGHOST=postgres
-      - PGPASSWORD=postgres_password
-      - PGDATABASE=postgres
-      - PGPORT=5432
-  client:
-    build:
-      dockerfile: Dockerfile.dev
-      context: ./client
-    volumes:
-      - /app/node_modules
-      - ./client:/app
-    environment:
-      - WDS_SOCKET_PORT=0
-  worker:
-    build:
-      dockerfile: Dockerfile.dev
-      context: ./worker
-    volumes:
-      - /app/node_modules
-      - ./worker:/app
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
   nginx:
-    restart: always
+    image: ${DOCKERHUB_NAMESPACE}/nginx-router:${TAG}
+    ports:
+      - "80:80"
     depends_on:
       - api
       - client
-    build:
-      dockerfile: Dockerfile.dev
-      context: ./nginx
+
+  client:
+    image: ${DOCKERHUB_NAMESPACE}/react-client:${TAG}
+    # If your client image is pure static (served by nginx), this container may be unnecessary.
+    # If client runs a Node process (SSR/CSR dev server), keep it and adjust nginx upstreams.
+
+  api:
+    image: ${DOCKERHUB_NAMESPACE}/node-server:${TAG}
+    environment:
+      # Example vars—replace with your real config or use EB console env vars.
+      - NODE_ENV=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PGUSER=${PGUSER}
+      - PGHOST=${PGHOST}
+      - PGPASSWORD=${PGPASSWORD}
+      - PGDATABASE=${PGDATABASE}
+      - PGPORT=${PGPORT}
     ports:
-      - "3050:80"
+      - "5000:5000"
+
+  worker:
+    image: ${DOCKERHUB_NAMESPACE}/node-worker:${TAG}
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  # OPTIONAL: Only if you truly want Redis/Postgres as containers inside EB.
+  # For production, I recommend AWS services instead (ElastiCache + RDS).
+  redis:
+    image: redis:7-alpine
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_PASSWORD=${PGPASSWORD}
+      - POSTGRES_USER=${PGUSER}
+      - POSTGRES_DB=${PGDATABASE}
+    # Named volume to persist data inside the EC2 instance (still ephemeral if the instance is replaced)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
