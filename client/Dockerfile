@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Use npm ci for reproducible installs in CI
-RUN npm ci
+RUN npm install
 
 # --- Test stage
 FROM deps AS test
