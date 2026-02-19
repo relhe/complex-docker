@@ -178,8 +178,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Generate a v2 Dockerrun file referencing the exact :SHA tags we just pushed
-      # Only Nginx exposes port 80 publicly; other containers are linked internally.
+      # Generate a v2 Dockerrun file referen
       - name: Generate Dockerrun.aws.json (v2)
         run: |
           cat > Dockerrun.aws.json <<'JSON'
