@@ -10,7 +10,7 @@ const redisClient = redis.createClient({
   },
 });
 
-redisClient.on("error", (err) => console.log("Redis Client Error", err));
+redisClient.on("error", (err) => console.log("Redis Client Error is running", err));
 
 const sub = redisClient.duplicate();
 
