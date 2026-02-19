@@ -48,18 +48,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Build the client image (no test target required). We'll override the command to run tests.
-      - name: Build client image for tests
+      # Build the client test stage (Node-based) and load it locally
+      - name: Build client test image (target=test)
         uses: docker/build-push-action@v6
         with:
           context: ./client
           file: ./client/Dockerfile
+          target: test
           load: true
           tags: client-test:local
 
+      # Run tests (the test stage CMD runs them)
       - name: Run client tests
-        run: |
-          docker run --rm -e CI=true client-test:local npm test -- --ci --watchAll=false
+        run: docker run --rm -e CI=true client-test:local
 
   build_and_push:
     name: Build & Push images
@@ -161,11 +162,11 @@ jobs:
           echo "TAG=${SHA}" >> .env
 
           # If you insist on bundling DB creds (not recommended), uncomment and add repo secrets:
-          # echo "PGUSER=${{ secrets.PGUSER }}" >> .env
-          # echo "PGPASSWORD=${{ secrets.PGPASSWORD }}" >> .env
-          # echo "PGHOST=${{ secrets.PGHOST }}" >> .env
-          # echo "PGDATABASE=${{ secrets.PGDATABASE }}" >> .env
-          # echo "PGPORT=${{ secrets.PGPORT }}" >> .env
+          echo "PGUSER=${{ secrets.PGUSER }}" >> .env
+          echo "PGPASSWORD=${{ secrets.PGPASSWORD }}" >> .env
+          echo "PGHOST=${{ secrets.PGHOST }}" >> .env
+          echo "PGDATABASE=${{ secrets.PGDATABASE }}" >> .env
+          echo "PGPORT=${{ secrets.PGPORT }}" >> .env
 
           zip "app-${SHA}.zip" docker-compose.yml .env
         env:
