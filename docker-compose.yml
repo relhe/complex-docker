@@ -3,6 +3,8 @@ version: "3"
 services:
   nginx:
     image: ${DOCKERHUB_NAMESPACE}/nginx-router:${TAG}
+    mem_limit: 128m
+    hostname: nginx
     ports:
       - "80:80"
     depends_on:
@@ -11,13 +13,14 @@ services:
 
   client:
     image: ${DOCKERHUB_NAMESPACE}/react-client:${TAG}
-    # If your client image is pure static (served by nginx), this container may be unnecessary.
-    # If client runs a Node process (SSR/CSR dev server), keep it and adjust nginx upstreams.
+    mem_limit: 128m
+    hostname: client
 
   api:
     image: ${DOCKERHUB_NAMESPACE}/node-server:${TAG}
+    mem_limit: 128m
+    hostname: api
     environment:
-      # Example vars—replace with your real config or use EB console env vars.
       - NODE_ENV=production
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -31,6 +34,8 @@ services:
 
   worker:
     image: ${DOCKERHUB_NAMESPACE}/node-worker:${TAG}
+    mem_limit: 128m
+    hostname: worker
     environment:
       - NODE_ENV=production
       - REDIS_HOST=redis
