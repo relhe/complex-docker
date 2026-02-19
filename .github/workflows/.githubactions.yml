@@ -1,0 +1,263 @@
+# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
+
+name: CI/CD – Docker Hub & Elastic Beanstalk (multi-service)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# Prevent overlapping deploys on the same branch
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Common tags and namespace
+  SHA: ${{ github.sha }}
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+
+  # AWS / EB
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EB_APPLICATION_NAME: ${{ secrets.EB_APPLICATION_NAME }}
+  EB_ENVIRONMENT_NAME: ${{ secrets.EB_ENVIRONMENT_NAME }}
+  S3_BUCKET: ${{ secrets.S3_BUCKET }} # Bucket to store the EB application bundle
+
+  # Service repo names on Docker Hub (adjust if you prefer different names)
+  CLIENT_IMAGE: react-client
+  SERVER_IMAGE: node-server
+  WORKER_IMAGE: node-worker
+  NGINX_IMAGE: nginx-router
+
+jobs:
+  # 1) Build the React client's test image and run tests from inside the container
+  test_client:
+    name: Test React client (in Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login only needed if the Dockerfile pulls private bases; harmless otherwise.
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Option A (recommended): your ./client/Dockerfile has a `test` stage
+      #   e.g., `FROM node:XX as test` -> installs deps and can run tests
+      # If you don't have a test stage, see Option B below.
+      - name: Build client test image (target=test)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./client
+          file: ./client/Dockerfile
+          target: test
+          load: true
+          tags: client-test:local
+
+      # Override CMD to run your tests; adapt to your test script
+      - name: Run client tests
+        run: |
+          # If your test image already has CMD that runs tests, you can omit the command override.
+          docker run --rm -e CI=true client-test:local npm test -- --ci --watchAll=false
+
+      # -----
+      # Option B (uncomment if you keep tests in a separate Dockerfile, e.g., ./client/Dockerfile.test)
+      # - name: Build client test image (Dockerfile.test)
+      #   uses: docker/build-push-action@v6
+      #   with:
+      #     context: ./client
+      #     file: ./client/Dockerfile.test
+      #     load: true
+      #     tags: client-test:local
+      #
+      # - name: Run client tests (Dockerfile.test)
+      #   run: docker run --rm -e CI=true client-test:local
+
+  # 2) Build and push all production images to Docker Hub if tests pass
+  build_and_push:
+    name: Build & Push images (client/server/worker/nginx)
+    runs-on: ubuntu-latest
+    needs: [ test_client ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # React client (production)
+      - name: Build & Push – client
+        uses: docker/build-push-action@v6
+        with:
+          context: ./client
+          file: ./client/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            NODE_ENV=production
+          tags: |
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:${{ env.SHA }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:latest
+
+      # Node Express server
+      - name: Build & Push – server
+        uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            NODE_ENV=production
+          tags: |
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:${{ env.SHA }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:latest
+
+      # Node worker
+      - name: Build & Push – worker
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            NODE_ENV=production
+          tags: |
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:${{ env.SHA }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:latest
+
+      # Nginx router
+      - name: Build & Push – nginx router
+        uses: docker/build-push-action@v6
+        with:
+          context: ./nginx
+          file: ./nginx/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:${{ env.SHA }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:latest
+
+  # 3) Create EB application version (Dockerrun.aws.json) and deploy
+  deploy_eb:
+    name: Deploy to Elastic Beanstalk
+    runs-on: ubuntu-latest
+    needs: [ build_and_push ]
+    permissions:
+      id-token: write   # if you switch to OIDC/role assumption later
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        # For static keys (stored in secrets). Prefer IAM Role + OIDC if possible.
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Generate a v2 Dockerrun file referencing the exact :SHA tags we just pushed
+      # Only Nginx exposes port 80 publicly; other containers are linked internally.
+      - name: Generate Dockerrun.aws.json (v2)
+        run: |
+          cat > Dockerrun.aws.json <<'JSON'
+          {
+            "AWSEBDockerrunVersion": 2,
+            "containerDefinitions": [
+              {
+                "name": "nginx",
+                "image": "${DOCKERHUB_NAMESPACE}/${NGINX_IMAGE}:${SHA}",
+                "essential": true,
+                "memory": 256,
+                "portMappings": [
+                  { "hostPort": 80, "containerPort": 80 }
+                ],
+                "links": ["server","client"]
+              },
+              {
+                "name": "client",
+                "image": "${DOCKERHUB_NAMESPACE}/${CLIENT_IMAGE}:${SHA}",
+                "essential": false,
+                "memory": 256,
+                "portMappings": [
+                  { "hostPort": 0, "containerPort": 3000 }
+                ]
+              },
+              {
+                "name": "server",
+                "image": "${DOCKERHUB_NAMESPACE}/${SERVER_IMAGE}:${SHA}",
+                "essential": true,
+                "memory": 256,
+                "portMappings": [
+                  { "hostPort": 0, "containerPort": 5000 }
+                ]
+              },
+              {
+                "name": "worker",
+                "image": "${DOCKERHUB_NAMESPACE}/${WORKER_IMAGE}:${SHA}",
+                "essential": false,
+                "memory": 256
+              }
+            ]
+          }
+          JSON
+        env:
+          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
+          CLIENT_IMAGE: ${{ env.CLIENT_IMAGE }}
+          SERVER_IMAGE: ${{ env.SERVER_IMAGE }}
+          WORKER_IMAGE: ${{ env.WORKER_IMAGE }}
+          NGINX_IMAGE: ${{ env.NGINX_IMAGE }}
+          SHA: ${{ env.SHA }}
+
+      - name: Create EB application bundle (.zip)
+        run: zip "app-${SHA}.zip" Dockerrun.aws.json
+        env:
+          SHA: ${{ env.SHA }}
+
+      - name: Upload bundle to S3
+        run: aws s3 cp "app-${SHA}.zip" "s3://${S3_BUCKET}/app-${SHA}.zip"
+        env:
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          SHA: ${{ env.SHA }}
+
+      - name: Register EB application version
+        run: |
+          aws elasticbeanstalk create-application-version \
+            --application-name "${EB_APPLICATION_NAME}" \
+            --version-label "${SHA}" \
+            --source-bundle S3Bucket="${S3_BUCKET}",S3Key="app-${SHA}.zip"
+        env:
+          EB_APPLICATION_NAME: ${{ env.EB_APPLICATION_NAME }}
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          SHA: ${{ env.SHA }}
+
+      - name: Deploy (update EB environment)
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --version-label "${SHA}"
+        env:
+          EB_ENVIRONMENT_NAME: ${{ env.EB_ENVIRONMENT_NAME }}
+          SHA: ${{ env.SHA }}
