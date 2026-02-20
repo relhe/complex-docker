@@ -1,94 +1,55 @@
-name: CI/CD – Docker Hub & Elastic Beanstalk (AL2 Multi-Container)
+name: CI/CD – Build · Scan · Deploy · Verify
 
 on:
   push:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild all images (skip change detection)"
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # Tag everything with the commit SHA
   SHA: ${{ github.sha }}
-
-  # Docker Hub namespace (org/username)
   DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
-
-  # AWS / EB
   AWS_REGION: ${{ secrets.AWS_REGION }}
   EB_APPLICATION_NAME: ${{ secrets.EB_APPLICATION_NAME }}
   EB_ENVIRONMENT_NAME: ${{ secrets.EB_ENVIRONMENT_NAME }}
   S3_BUCKET: ${{ secrets.S3_BUCKET }}
-
-  # Image repo names on Docker Hub
   CLIENT_IMAGE: react-client
   SERVER_IMAGE: node-server
   WORKER_IMAGE: node-worker
   NGINX_IMAGE: nginx-router
 
 jobs:
-  test_client:
-    name: Test React client (Dockerized)
+  # ── 1. DETECT CHANGES ──────────────────────────────────────────────────────
+  # Centralised change detection so every build job reads from one source of
+  # truth.  The `common` filter (compose file, workflow changes) forces a full
+  # rebuild of all images, as does the manual force_rebuild input.
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      client: ${{ steps.out.outputs.client }}
+      server: ${{ steps.out.outputs.server }}
+      worker: ${{ steps.out.outputs.worker }}
+      nginx:  ${{ steps.out.outputs.nginx  }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Build the client test stage (Node-based) and load it locally
-      - name: Build client test image (target=test)
-        uses: docker/build-push-action@v6
-        with:
-          context: ./client
-          file: ./client/Dockerfile
-          target: test
-          load: true
-          tags: client-test:local
-
-      # Run tests (the test stage CMD runs them)
-      - name: Run client tests
-        run: docker run --rm -e CI=true client-test:local
-  build_and_push:
-    name: Build & Push images (skip unchanged)
-    runs-on: ubuntu-latest
-    needs: [test_client]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # 1) Detect which folders changed
-      - name: Detect changes
-        id: changes
-        uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v3
+        id: filter
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # Adjust paths if your structure differs
           filters: |
+            common:
+              - 'docker-compose.yml'
+              - '.github/workflows/**'
             client:
               - 'client/**'
             server:
@@ -97,102 +58,190 @@ jobs:
               - 'worker/**'
             nginx:
               - 'nginx/**'
-            common:
-              - 'docker-compose.yml'
-              - '.github/workflows/**'
 
-      # Helper: function to safely retag (copy) an existing tag to the new SHA tag
-      # Uses imagetools to copy the current :latest digest to :${SHA} without rebuilding
-      - name: Enable imagetools (for retagging)
+      # force_rebuild OR any change to shared files rebuilds everything
+      - name: Resolve final change flags
+        id: out
         run: |
-          docker buildx version
-          # buildx imagetools is available with setup-buildx-action; nothing else needed
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+          COMMON="${{ steps.filter.outputs.common }}"
+          if [[ "$FORCE" == "true" || "$COMMON" == "true" ]]; then
+            echo "client=true" >> "$GITHUB_OUTPUT"
+            echo "server=true" >> "$GITHUB_OUTPUT"
+            echo "worker=true" >> "$GITHUB_OUTPUT"
+            echo "nginx=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "client=${{ steps.filter.outputs.client }}" >> "$GITHUB_OUTPUT"
+            echo "server=${{ steps.filter.outputs.server }}" >> "$GITHUB_OUTPUT"
+            echo "worker=${{ steps.filter.outputs.worker }}" >> "$GITHUB_OUTPUT"
+            echo "nginx=${{ steps.filter.outputs.nginx }}"   >> "$GITHUB_OUTPUT"
+          fi
 
-      # 2) CLIENT
-      - name: Build & Push – client (changed)
-        if: steps.changes.outputs.client == 'true'
+  # ── 2a. BUILD · TEST · PUSH · SCAN – client ────────────────────────────────
+  # Tests run first (only when source changed), blocking the production push.
+  # Registry cache (buildcache tag) keeps layer reuse between runs.
+  build_client:
+    name: Build client
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build test stage
+        if: needs.changes.outputs.client == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./client
+          file: ./client/Dockerfile
+          target: test
+          load: true
+          tags: client-test:ci
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:buildcache
+
+      - name: Run client tests
+        if: needs.changes.outputs.client == 'true'
+        run: docker run --rm -e CI=true client-test:ci
+
+      - name: Build & push (changed)
+        if: needs.changes.outputs.client == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./client
           file: ./client/Dockerfile
           push: true
           platforms: linux/amd64
-          build-args: |
-            NODE_ENV=production
+          build-args: NODE_ENV=production
           tags: |
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:buildcache
+          cache-to:   type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:buildcache,mode=max
 
-      - name: Retag – client (unchanged)
-        if: steps.changes.outputs.client != 'true'
+      - name: Retag (unchanged)
+        if: needs.changes.outputs.client != 'true'
         run: |
-          # Reuse existing digest (prefer latest) and assign the new SHA tag
-          SRC="${DOCKERHUB_NAMESPACE}/${CLIENT_IMAGE}:latest"
-          DST="${DOCKERHUB_NAMESPACE}/${CLIENT_IMAGE}:${SHA}"
-          echo "Retagging ${SRC} -> ${DST}"
-          docker buildx imagetools create -t "${DST}" "${SRC}"
-        env:
-          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
-          CLIENT_IMAGE: ${{ env.CLIENT_IMAGE }}
-          SHA: ${{ env.SHA }}
+          docker buildx imagetools create \
+            -t ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:${{ env.SHA }} \
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:latest
 
-      # 3) SERVER (API)
-      - name: Build & Push – server (changed)
-        if: steps.changes.outputs.server == 'true'
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:${{ env.SHA }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"   # set to "1" to block on findings
+
+  # ── 2b. BUILD · PUSH · SCAN – server ───────────────────────────────────────
+  build_server:
+    name: Build server
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push (changed)
+        if: needs.changes.outputs.server == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./server
           file: ./server/Dockerfile
           push: true
           platforms: linux/amd64
-          build-args: |
-            NODE_ENV=production
+          build-args: NODE_ENV=production
           tags: |
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:buildcache
+          cache-to:   type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:buildcache,mode=max
 
-      - name: Retag – server (unchanged)
-        if: steps.changes.outputs.server != 'true'
+      - name: Retag (unchanged)
+        if: needs.changes.outputs.server != 'true'
         run: |
-          SRC="${DOCKERHUB_NAMESPACE}/${SERVER_IMAGE}:latest"
-          DST="${DOCKERHUB_NAMESPACE}/${SERVER_IMAGE}:${SHA}"
-          echo "Retagging ${SRC} -> ${DST}"
-          docker buildx imagetools create -t "${DST}" "${SRC}"
-        env:
-          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
-          SERVER_IMAGE: ${{ env.SERVER_IMAGE }}
-          SHA: ${{ env.SHA }}
+          docker buildx imagetools create \
+            -t ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:${{ env.SHA }} \
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:latest
 
-      # 4) WORKER
-      - name: Build & Push – worker (changed)
-        if: steps.changes.outputs.worker == 'true'
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:${{ env.SHA }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+  # ── 2c. BUILD · PUSH · SCAN – worker ───────────────────────────────────────
+  build_worker:
+    name: Build worker
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push (changed)
+        if: needs.changes.outputs.worker == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./worker
           file: ./worker/Dockerfile
           push: true
           platforms: linux/amd64
-          build-args: |
-            NODE_ENV=production
+          build-args: NODE_ENV=production
           tags: |
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:buildcache
+          cache-to:   type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:buildcache,mode=max
 
-      - name: Retag – worker (unchanged)
-        if: steps.changes.outputs.worker != 'true'
+      - name: Retag (unchanged)
+        if: needs.changes.outputs.worker != 'true'
         run: |
-          SRC="${DOCKERHUB_NAMESPACE}/${WORKER_IMAGE}:latest"
-          DST="${DOCKERHUB_NAMESPACE}/${WORKER_IMAGE}:${SHA}"
-          echo "Retagging ${SRC} -> ${DST}"
-          docker buildx imagetools create -t "${DST}" "${SRC}"
-        env:
-          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
-          WORKER_IMAGE: ${{ env.WORKER_IMAGE }}
-          SHA: ${{ env.SHA }}
+          docker buildx imagetools create \
+            -t ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:${{ env.SHA }} \
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:latest
 
-      # 5) NGINX
-      - name: Build & Push – nginx (changed)
-        if: steps.changes.outputs.nginx == 'true'
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:${{ env.SHA }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+  # ── 2d. BUILD · PUSH · SCAN – nginx ────────────────────────────────────────
+  build_nginx:
+    name: Build nginx
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push (changed)
+        if: needs.changes.outputs.nginx == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./nginx
@@ -202,57 +251,73 @@ jobs:
           tags: |
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:buildcache
+          cache-to:   type=registry,ref=${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:buildcache,mode=max
 
-      - name: Retag – nginx (unchanged)
-        if: steps.changes.outputs.nginx != 'true'
+      - name: Retag (unchanged)
+        if: needs.changes.outputs.nginx != 'true'
         run: |
-          SRC="${DOCKERHUB_NAMESPACE}/${NGINX_IMAGE}:latest"
-          DST="${DOCKERHUB_NAMESPACE}/${NGINX_IMAGE}:${SHA}"
-          echo "Retagging ${SRC} -> ${DST}"
-          docker buildx imagetools create -t "${DST}" "${SRC}"
-        env:
-          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
-          NGINX_IMAGE: ${{ env.NGINX_IMAGE }}
-          SHA: ${{ env.SHA }}
-  deploy_eb:
-    name: Deploy to Elastic Beanstalk (AL2 Multi-Container w/ Compose v3)
-    runs-on: ubuntu-latest
-    needs: [build_and_push]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+          docker buildx imagetools create \
+            -t ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:${{ env.SHA }} \
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:latest
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          image-ref: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:${{ env.SHA }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+  # ── 3. DEPLOY TO ELASTIC BEANSTALK ─────────────────────────────────────────
+  # Gates on all 4 build jobs (parallel fan-in).
+  # Captures the current EB version before deploying so rollback has a target.
+  # The `environment: production` key enables the GitHub Environments approval
+  # gate – configure required reviewers in repo Settings → Environments.
+  deploy_eb:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: [build_client, build_server, build_worker, build_nginx]
+    environment: production
+    outputs:
+      previous_version: ${{ steps.prev.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      - name: Create EB bundle (no secrets)
+      - name: Capture current EB version (rollback target)
+        id: prev
+        run: |
+          PREV=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${{ env.EB_ENVIRONMENT_NAME }}" \
+            --query "Environments[0].VersionLabel" \
+            --output text 2>/dev/null || echo "None")
+          echo "label=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "Previous version: ${PREV}"
+
+      - name: Create deployment bundle
         run: |
           set -euo pipefail
-          : "${DOCKERHUB_NAMESPACE:?DOCKERHUB_NAMESPACE is required}"
-          : "${SHA:?SHA is required}"
-
-          # Only non-sensitive vars for image resolution & diagnostics
+          : "${DOCKERHUB_NAMESPACE:?}"
+          : "${SHA:?}"
           echo "DOCKERHUB_NAMESPACE=${DOCKERHUB_NAMESPACE}" > .env
-          echo "TAG=${SHA}" >> .env
-          echo "GIT_SHA=${SHA}" >> .env
-
-          # Zip compose + .env + platform hooks (EB reads these to resolve images and run predeploy hooks)
+          echo "TAG=${SHA}"                                >> .env
+          echo "GIT_SHA=${SHA}"                           >> .env
           zip -q -r "app-${SHA}.zip" docker-compose.yml .env .platform/
         env:
           DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
           SHA: ${{ env.SHA }}
 
       - name: Upload bundle to S3
-        run: |
-          set -euo pipefail
-          aws s3 cp "app-${SHA}.zip" "s3://${S3_BUCKET}/app-${SHA}.zip"
+        run: aws s3 cp "app-${SHA}.zip" "s3://${S3_BUCKET}/app-${SHA}.zip"
         env:
           S3_BUCKET: ${{ env.S3_BUCKET }}
           SHA: ${{ env.SHA }}
@@ -261,35 +326,132 @@ jobs:
         run: |
           set -euo pipefail
           aws elasticbeanstalk create-application-version \
-            --application-name "${EB_APPLICATION_NAME}" \
-            --version-label "${SHA}" \
-            --source-bundle S3Bucket="${S3_BUCKET}",S3Key="app-${SHA}.zip"
-        env:
-          EB_APPLICATION_NAME: ${{ env.EB_APPLICATION_NAME }}
-          S3_BUCKET: ${{ env.S3_BUCKET }}
-          SHA: ${{ env.SHA }}
+            --application-name "${{ env.EB_APPLICATION_NAME }}" \
+            --version-label    "${{ env.SHA }}" \
+            --source-bundle S3Bucket="${{ env.S3_BUCKET }}",S3Key="app-${{ env.SHA }}.zip"
 
-      - name: Deploy (Update EB environment)
+      - name: Deploy new version
         run: |
           set -euo pipefail
           aws elasticbeanstalk update-environment \
-            --environment-name "${EB_ENVIRONMENT_NAME}" \
-            --version-label "${SHA}"
-        env:
-          EB_ENVIRONMENT_NAME: ${{ env.EB_ENVIRONMENT_NAME }}
-          SHA: ${{ env.SHA }}
+            --environment-name "${{ env.EB_ENVIRONMENT_NAME }}" \
+            --version-label    "${{ env.SHA }}"
 
-      - name: Wait for EB environment update to finish
+      - name: Wait for environment to be Ready
         run: |
           set -euo pipefail
-          # Wait until the update completes (success or failure)
           aws elasticbeanstalk wait environment-updated \
-            --environment-names "${EB_ENVIRONMENT_NAME}"
-
-          # Optional: surface final health/status
+            --environment-names "${{ env.EB_ENVIRONMENT_NAME }}"
           aws elasticbeanstalk describe-environments \
-            --environment-names "${EB_ENVIRONMENT_NAME}" \
-            --query "Environments[0].{Status:Status, Health:Health, HealthStatus:HealthStatus, Version:VersionLabel, Endpoint:EndpointURL}" \
+            --environment-names "${{ env.EB_ENVIRONMENT_NAME }}" \
+            --query "Environments[0].{Status:Status,Health:Health,HealthStatus:HealthStatus,Version:VersionLabel,Endpoint:EndpointURL}" \
             --output table
         env:
           EB_ENVIRONMENT_NAME: ${{ env.EB_ENVIRONMENT_NAME }}
+
+  # ── 4. SMOKE TEST ───────────────────────────────────────────────────────────
+  # Probes the live endpoints with retries.  Fails the workflow (triggering
+  # rollback) if any endpoint stays unhealthy after all attempts.
+  smoke_test:
+    name: Smoke test
+    runs-on: ubuntu-latest
+    needs: deploy_eb
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Resolve application URL
+        id: url
+        run: |
+          ENDPOINT=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${{ env.EB_ENVIRONMENT_NAME }}" \
+            --query "Environments[0].EndpointURL" \
+            --output text)
+          echo "base=http://${ENDPOINT}" >> "$GITHUB_OUTPUT"
+          echo "Application URL: http://${ENDPOINT}"
+
+      - name: Probe health endpoints (5 retries, 15 s apart)
+        run: |
+          BASE="${{ steps.url.outputs.base }}"
+          probe() {
+            local path="$1" expected="$2"
+            echo "Probing ${BASE}${path} (expecting HTTP ${expected})"
+            for i in 1 2 3 4 5; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${BASE}${path}" 2>/dev/null || echo "000")
+              echo "  attempt ${i}: HTTP ${CODE}"
+              [[ "$CODE" == "$expected" ]] && return 0
+              sleep 15
+            done
+            echo "FAILED: ${path} never returned ${expected}" >&2
+            return 1
+          }
+          probe "/api/values/all"     "200"
+          probe "/api/values/current" "200"
+          echo "All smoke tests passed."
+
+      - name: Write job summary
+        if: always()
+        run: |
+          BASE="${{ steps.url.outputs.base }}"
+          {
+            echo "## Smoke Test – $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "**Deployed version:** \`${{ env.SHA }}\`"
+            echo "**URL:** ${BASE}"
+            echo ""
+            echo "| Endpoint | HTTP | Result |"
+            echo "|----------|------|--------|"
+            for path in "/api/values/all" "/api/values/current"; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${BASE}${path}" 2>/dev/null || echo "ERR")
+              RESULT=$([[ "$CODE" == "200" ]] && echo "PASS" || echo "FAIL")
+              echo "| \`${path}\` | ${CODE} | ${RESULT} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 5. AUTO-ROLLBACK ON SMOKE FAILURE ──────────────────────────────────────
+  # Runs only when the smoke test fails but the deploy itself succeeded
+  # (i.e. the new version is bad, not an infra outage).
+  rollback:
+    name: Rollback to previous version
+    runs-on: ubuntu-latest
+    needs: [deploy_eb, smoke_test]
+    if: |
+      failure() &&
+      needs.deploy_eb.result == 'success' &&
+      needs.deploy_eb.outputs.previous_version != 'None' &&
+      needs.deploy_eb.outputs.previous_version != ''
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Roll back to ${{ needs.deploy_eb.outputs.previous_version }}
+        run: |
+          PREV="${{ needs.deploy_eb.outputs.previous_version }}"
+          echo "Smoke tests failed for ${{ env.SHA }} — rolling back to ${PREV}"
+          aws elasticbeanstalk update-environment \
+            --environment-name "${{ env.EB_ENVIRONMENT_NAME }}" \
+            --version-label    "${PREV}"
+
+      - name: Wait for rollback to complete
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --environment-names "${{ env.EB_ENVIRONMENT_NAME }}"
+          aws elasticbeanstalk describe-environments \
+            --environment-names "${{ env.EB_ENVIRONMENT_NAME }}" \
+            --query "Environments[0].{Status:Status,Health:Health,Version:VersionLabel}" \
+            --output table
+        env:
+          EB_ENVIRONMENT_NAME: ${{ env.EB_ENVIRONMENT_NAME }}
+
+      - name: Annotate summary
+        run: |
+          {
+            echo "## ROLLBACK TRIGGERED"
+            echo "Smoke tests failed for version \`${{ env.SHA }}\`."
+            echo "Rolled back to: \`${{ needs.deploy_eb.outputs.previous_version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
