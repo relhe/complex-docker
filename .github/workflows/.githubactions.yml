@@ -243,8 +243,8 @@ jobs:
           echo "TAG=${SHA}" >> .env
           echo "GIT_SHA=${SHA}" >> .env
 
-          # Zip compose + .env (EB reads these to resolve images)
-          zip -q "app-${SHA}.zip" docker-compose.yml .env
+          # Zip compose + .env + platform hooks (EB reads these to resolve images and run predeploy hooks)
+          zip -q -r "app-${SHA}.zip" docker-compose.yml .env .platform/
         env:
           DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
           SHA: ${{ env.SHA }}
