@@ -22,8 +22,8 @@ services:
     hostname: api
     environment:
       - NODE_ENV=production
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT:-6379}
       - PGUSER=${PGUSER}
       - PGHOST=${PGHOST}
       - PGPASSWORD=${PGPASSWORD}
@@ -38,5 +38,5 @@ services:
     hostname: worker
     environment:
       - NODE_ENV=production
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT:-6379}
