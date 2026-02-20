@@ -1,35 +1,49 @@
 import React from "react";
-import logo from "./logo.svg";
 import "./App.css";
-import { BrowserRouter as Router, Routes, Route, Link } from "react-router-dom";
+import { BrowserRouter as Router, Routes, Route, Link, useLocation } from "react-router-dom";
 import OtherPage from "./OtherPage";
 import Fib from "./Fib";
+
+function NavLink({ to, children }) {
+  const location = useLocation();
+  const isActive = location.pathname === to;
+  return (
+    <Link to={to} className={`nav-link${isActive ? " active" : ""}`}>
+      {children}
+    </Link>
+  );
+}
+
+function Layout() {
+  return (
+    <div className="App">
+      <nav className="navbar">
+        <Link to="/" className="navbar-brand">
+          <div className="navbar-icon">&#8721;</div>
+          <span className="navbar-title">Fib<span>Calc</span></span>
+        </Link>
+        <div className="navbar-nav">
+          <NavLink to="/">Calculator</NavLink>
+          <NavLink to="/otherpage">About</NavLink>
+        </div>
+      </nav>
+
+      <Routes>
+        <Route path="/" element={<Fib />} />
+        <Route path="/otherpage" element={<OtherPage />} />
+      </Routes>
+
+      <footer className="footer">
+        FibCalc &mdash; Distributed Fibonacci via Docker microservices
+      </footer>
+    </div>
+  );
+}
 
 function App() {
   return (
     <Router>
-      <div className="App">
-        <header className="App-header">
-          <img src={logo} className="App-logo" alt="logo" />
-          <p></p>
-          <a
-            className="App-link"
-            href="https://reactjs.org"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Learn React
-          </a>
-          <Link to="/">Home</Link>
-          <Link to="/otherpage">Other Page</Link>
-        </header>
-        <div>
-          <Routes>
-            <Route path="/" element={<Fib />} />
-            <Route path="/otherpage" element={<OtherPage />} />
-          </Routes>
-        </div>
-      </div>
+      <Layout />
     </Router>
   );
 }

@@ -17,7 +17,9 @@ const pgClient = new Pool({
   database: keys.pgDatabase,
   password: keys.pgPassword,
   port: keys.pgPort,
-  ssl: { rejectUnauthorized: false },
+  ...(process.env.NODE_ENV !== "development" && {
+    ssl: { rejectUnauthorized: false },
+  }),
 });
 
 pgClient.on("error", () => {
@@ -41,7 +43,7 @@ const redisClient = redis.createClient({
   socket: {
     host: keys.redisHost,
     port: keys.redisPort,
-    tls: true,
+    ...(process.env.NODE_ENV !== "development" && { tls: true }),
     reconnectStrategy: () => 1000,
   },
 });
