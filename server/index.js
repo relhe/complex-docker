@@ -17,6 +17,7 @@ const pgClient = new Pool({
   database: keys.pgDatabase,
   password: keys.pgPassword,
   port: keys.pgPort,
+  ssl: { rejectUnauthorized: false },
 });
 
 pgClient.on("error", () => {
@@ -82,7 +83,7 @@ app.post("/values", async (req, res) => {
 
   await redisPublisher.publish("insert", String(index));
 
-  pgClient.query("INSERT INTO values (number) VALUES($1)", [index]);
+  await pgClient.query("INSERT INTO values (number) VALUES($1)", [index]);
 
   res.send({ working: true });
 });
