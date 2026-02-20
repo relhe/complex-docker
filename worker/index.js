@@ -6,6 +6,7 @@ const redisClient = redis.createClient({
   socket: {
     host: keys.redisHost,
     port: keys.redisPort,
+    tls: true,
     reconnectStrategy: () => 1000,
   },
 });
