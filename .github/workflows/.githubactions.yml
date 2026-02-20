@@ -61,9 +61,8 @@ jobs:
       # Run tests (the test stage CMD runs them)
       - name: Run client tests
         run: docker run --rm -e CI=true client-test:local
-
   build_and_push:
-    name: Build & Push images
+    name: Build & Push images (skip unchanged)
     runs-on: ubuntu-latest
     needs: [test_client]
     steps:
@@ -82,8 +81,36 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # React client (prod)
-      - name: Build & Push – client
+      # 1) Detect which folders changed
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Adjust paths if your structure differs
+          filters: |
+            client:
+              - 'client/**'
+            server:
+              - 'server/**'
+            worker:
+              - 'worker/**'
+            nginx:
+              - 'nginx/**'
+            common:
+              - 'docker-compose.yml'
+              - '.github/workflows/**'
+
+      # Helper: function to safely retag (copy) an existing tag to the new SHA tag
+      # Uses imagetools to copy the current :latest digest to :${SHA} without rebuilding
+      - name: Enable imagetools (for retagging)
+        run: |
+          docker buildx version
+          # buildx imagetools is available with setup-buildx-action; nothing else needed
+
+      # 2) CLIENT
+      - name: Build & Push – client (changed)
+        if: steps.changes.outputs.client == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./client
@@ -96,8 +123,22 @@ jobs:
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.CLIENT_IMAGE }}:latest
 
-      # API server (Node/Express)
-      - name: Build & Push – api
+      - name: Retag – client (unchanged)
+        if: steps.changes.outputs.client != 'true'
+        run: |
+          # Reuse existing digest (prefer latest) and assign the new SHA tag
+          SRC="${DOCKERHUB_NAMESPACE}/${CLIENT_IMAGE}:latest"
+          DST="${DOCKERHUB_NAMESPACE}/${CLIENT_IMAGE}:${SHA}"
+          echo "Retagging ${SRC} -> ${DST}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
+        env:
+          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
+          CLIENT_IMAGE: ${{ env.CLIENT_IMAGE }}
+          SHA: ${{ env.SHA }}
+
+      # 3) SERVER (API)
+      - name: Build & Push – server (changed)
+        if: steps.changes.outputs.server == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./server
@@ -110,8 +151,21 @@ jobs:
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.SERVER_IMAGE }}:latest
 
-      # Worker
-      - name: Build & Push – worker
+      - name: Retag – server (unchanged)
+        if: steps.changes.outputs.server != 'true'
+        run: |
+          SRC="${DOCKERHUB_NAMESPACE}/${SERVER_IMAGE}:latest"
+          DST="${DOCKERHUB_NAMESPACE}/${SERVER_IMAGE}:${SHA}"
+          echo "Retagging ${SRC} -> ${DST}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
+        env:
+          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
+          SERVER_IMAGE: ${{ env.SERVER_IMAGE }}
+          SHA: ${{ env.SHA }}
+
+      # 4) WORKER
+      - name: Build & Push – worker (changed)
+        if: steps.changes.outputs.worker == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./worker
@@ -124,8 +178,21 @@ jobs:
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.WORKER_IMAGE }}:latest
 
-      # Nginx router
-      - name: Build & Push – nginx
+      - name: Retag – worker (unchanged)
+        if: steps.changes.outputs.worker != 'true'
+        run: |
+          SRC="${DOCKERHUB_NAMESPACE}/${WORKER_IMAGE}:latest"
+          DST="${DOCKERHUB_NAMESPACE}/${WORKER_IMAGE}:${SHA}"
+          echo "Retagging ${SRC} -> ${DST}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
+        env:
+          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
+          WORKER_IMAGE: ${{ env.WORKER_IMAGE }}
+          SHA: ${{ env.SHA }}
+
+      # 5) NGINX
+      - name: Build & Push – nginx (changed)
+        if: steps.changes.outputs.nginx == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./nginx
@@ -136,6 +203,17 @@ jobs:
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:${{ env.SHA }}
             ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.NGINX_IMAGE }}:latest
 
+      - name: Retag – nginx (unchanged)
+        if: steps.changes.outputs.nginx != 'true'
+        run: |
+          SRC="${DOCKERHUB_NAMESPACE}/${NGINX_IMAGE}:latest"
+          DST="${DOCKERHUB_NAMESPACE}/${NGINX_IMAGE}:${SHA}"
+          echo "Retagging ${SRC} -> ${DST}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
+        env:
+          DOCKERHUB_NAMESPACE: ${{ env.DOCKERHUB_NAMESPACE }}
+          NGINX_IMAGE: ${{ env.NGINX_IMAGE }}
+          SHA: ${{ env.SHA }}
   deploy_eb:
     name: Deploy to Elastic Beanstalk (AL2 Multi-Container w/ Compose v3)
     runs-on: ubuntu-latest
